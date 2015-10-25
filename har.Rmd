@@ -1,0 +1,271 @@
+---
+title: "Human Activity Recognition"
+subtitle: "Course Project"
+author: "E.N."
+date: "October 2015"
+output:
+  html_document:
+    fig_caption: yes
+    keep_md: yes
+    theme: cerulean
+graphics: yes
+---
+
+```{r setoptions, echo=FALSE}
+library(knitr,			quietly = TRUE, warn.conflicts=FALSE)
+
+suppressWarnings(suppressMessages(library(kfigr)))
+library(kfigr,			quietly = TRUE, warn.conflicts=FALSE)
+library(knitcitations,		quietly = TRUE, warn.conflicts=FALSE)
+
+opts_chunk$set(fig.width=6.5, fig.height=8, fig.align="center")
+```
+
+```{r init, results='hide', echo=FALSE}
+# Get libraries
+library(lubridate,		quietly = TRUE, warn.conflicts=FALSE)
+library(reshape2,		quietly = TRUE, warn.conflicts=FALSE)
+library(dplyr,			quietly = TRUE, warn.conflicts=FALSE)
+library(purrr,			quietly = TRUE, warn.conflicts=FALSE)
+library(data.table,		quietly = TRUE, warn.conflicts=FALSE)
+suppressWarnings(suppressMessages(library(xtable)))
+library(xtable,			quietly = TRUE, warn.conflicts=FALSE)
+options(xtable.comment = FALSE)
+library(tufterhandout,		quietly = TRUE, warn.conflicts=FALSE)
+library(ggplot2,		quietly = TRUE, warn.conflicts=FALSE)
+library(ggthemes,		quietly = TRUE, warn.conflicts=FALSE)
+library(GGally,			quietly = TRUE, warn.conflicts=FALSE)
+library(gridExtra,		quietly = TRUE, warn.conflicts=FALSE)
+library(RColorBrewer,		quietly = TRUE, warn.conflicts=FALSE)
+library(car,			quietly = TRUE, warn.conflicts=FALSE)
+library(caret,			quietly = TRUE, warn.conflicts=FALSE)
+suppressWarnings(suppressMessages(library(randomForest)))
+library(randomForest,		quietly = TRUE, warn.conflicts=FALSE)
+library(tree,			quietly = TRUE, warn.conflicts=FALSE)
+library(rpart,			quietly = TRUE, warn.conflicts=FALSE)
+library(rpart.plot,		quietly = TRUE, warn.conflicts=FALSE)
+suppressWarnings(suppressMessages(library(party)))
+library(party,			quietly = TRUE, warn.conflicts=FALSE)
+library(partykit,		quietly = TRUE, warn.conflicts=FALSE)
+```
+
+```{r auxfunctions, include=FALSE}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+```
+
+
+
+
+  
+## Summary
+In this project, we use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. The participants
+were asked to perform barbell lifts correctly and incorrectly in 5 different ways. In order to quantify how well people perform exercises
+a model is built to predict in which manner the participants did the exercise.
+The data in this report uses the HAR Dataset for benchmarking from http://groupware.les.inf.puc-rio.br/har
+
+This reports describes how the model was built, how cross validation was used, the expected out of sample error, and a justification for the choices made. 
+
+
+## Preparation
+
+### Loading
+```{r setup, echo=FALSE, cache=FALSE}
+# Define data source
+har_data	<- "../data/pml-training.csv"
+
+# Create folder 'data' if it doesn't exist
+if ( !file.exists("../data") ) {
+	dir.create("../data")
+}
+
+# Extract the source file if it doesn't exist yet,
+if ( !file.exists(har_data) ) {
+	url	<- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+	if ( download.file(url, method="curl", destfile="../data/pml-training") > 0 ) {
+		stop("Download error")
+	}
+}
+```
+
+First we read a small chunk of data (code not shown). This reveals some mising data, identified by `NA`, `"#DIV/0!"` or just `""` (empty strings),
+this shows partly because columns are identified as having type character. After dealing with this, next we can observe logical columns; they are
+not, it's just that every entry is `NA`. These columns can be discarded immediately.  
+
+```{r preloading, eval=FALSE, echo=FALSE, cache=FALSE}
+# Load the data
+chunk	<- read.csv(har_data, header=TRUE, sep=",", na.strings=c("NA","#DIV/0!",""), stringsAsFactors = FALSE, nrows = 5)
+classes <- sapply(chunk, class)
+logis	<- which(classes=="logical")
+colSums(is.na( chunk[,which(classes=="logical")])) ```
+
+Now import the data as follows:
+
+```{r loading, cache=TRUE}
+# Load the data
+df	<- read.csv(har_data, header=TRUE, sep=",", na.strings=c("NA","#DIV/0!",""), stringsAsFactors = FALSE)
+
+classes <- sapply(df, class)
+logis	<- which(classes=="logical")
+sum(colSums(is.na(df[,logis])) == nrow(df)) == length(logis)	# just to verify
+
+df	<- select(df, -one_of(names(logis)))
+dim(df)
+```
+The dataset now contains `r nrow(df)` observations and there are `r ncol(df)` variables.
+Since we are interested in `classe` as an outcome, that leaves `r ncol(df)-1` variables to explore. 
+
+
+### Clean up
+There is still a lot of data missing; if a large majority of values are missing for a predictor (variable, column) it wil not
+be relevant for the prediction. With a threshold of say 80 % of the observations missing we drop these variables; this means
+`r sum(colSums(is.na(df)) >= .8 * nrow(df))` variables less. Also, the first seven variables 
+("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window" and "num_window")
+are not (accelerometers) measurements from which to predict how the exercise was done, so they can be dropped as well.
+```{r}
+df	<- select(df, -which(colSums(is.na(df)) >= .8 * nrow(df)) )
+df	<- select(df, -(1:7))
+df	<- mutate(df, classe=factor(classe))	# make models use classification if needed
+dim(df)
+```
+Excluding `classe`, that leaves now `r ncol(df)-1` variables. 
+
+
+Models may benefit from reducing the level of correlation between the predictors. Given a correlation matrix,
+the `findCorrelation` function can be used to find predictors for removal.
+```{r}
+m.cor	<- (df[,-ncol(df)])	# remove last (the outcome)
+high.cor<- findCorrelation(cor(m.cor), cutoff = .8)
+df	<- df[,-high.cor]
+```
+Excluding `classe`, that leaves now `r ncol(df)-1` variables for prediction. 
+
+
+
+### Preparing & Splitting
+The data set will be divided in a training set and test set, 75% and 25 % respectively.
+```{r prepare, cache=TRUE}
+set.seed(201510)
+
+in_train	<- createDataPartition(y=df$classe, p=3/4, list=FALSE)
+train.set	<- df[in_train, ]
+test.set	<- df[-in_train, ]
+```
+
+This gives a training set of `r nrow(train.set)` observations and a test set of `r nrow(test.set)` observations.
+
+
+## Analysis
+
+### Model description
+As the prediction concerns a classificaition, there are a number of models to choose from, like
+"classification trees", "randowm forest" or "support vector machines".
+(see also for example http://topepo.github.io/caret/modelList.html)
+Random forsests are populare because they are accurate, so let's start with that.
+(and if accurate enough, trying others is less necessary).
+
+```{r build, cache=TRUE}
+redo		<- FALSE
+mname		<- "model_rf.RDS"
+predictors	<- train.set[,-ncol(train.set)]
+response	<- train.set$classe
+
+if ( !file.exists(mname) || redo ) {
+	model.rf	<- randomForest(x=predictors, y=response, importance=TRUE)
+	saveRDS(model.rf, file=mname)
+} else {
+	model.rf	<- readRDS(mname)
+}
+model.rf
+```
+The out-of-bag (oob) error estimate equals `r tail(model.rf$err.rate[,"OOB"],1)`, or 
+`r round(100*tail(model.rf$err.rate[,"OOB"],1), 2)` % (calculated internally, so no
+separate cross validation needed with random forests [http://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm#ooberr]).
+
+
+### Prediction
+```{r predict, cache=TRUE}
+prediction	<- predict( model.rf, newdata=test.set)
+table(prediction, test.set$classe)
+
+model.rf.cm	<- confusionMatrix(prediction, test.set$classe)
+model.rf.cm
+
+```
+
+The random forest model create gives us an overall accuracy of `r model.rf.cm$overall["Accuracy"]`
+or `r round(100*model.rf.cm$overall["Accuracy"], 2)` %, which looks accurate enough. 
+
+
+In Appendix A are two dotcharts of variable importance as measured by the random forest model.
+
+
+
+
+
+\pagebreak
+
+# Appendix A
+
+## Random forest variables importance
+```{r plot1, echo=FALSE}
+varImpPlot(model.rf, type=1)
+```
+
+```{r plot2, echo=FALSE}
+varImpPlot(model.rf, type=2)
+```
+
+
+
+
+\pagebreak
+
+# Appendix B
+
+
+## Software environment
+Some information about the environment where this document is executed.
+```{r env, cache=FALSE, echo=TRUE}
+sessionInfo()
+```
+
+## Post processing
+Used to reference variables defined later on. After http://stackoverflow.com/questions/23570718/creating-summaries-at-the-top-of-a-knitr-report-that-use-variables-that-are-defi
+
+
+In order to print the values of these variables in place, i.e. ahead of definition, use brew markup: <%%= variable %%> .
+
+```{r pp, cache=FALSE, echo=TRUE}
+require(knitr, quietly = TRUE)
+knit_hooks$set(document=function(x){
+                        x1 <- paste(x, collapse = '\n')
+                        paste(capture.output(brew::brew(text = x1)), collapse = '\n')
+                        }
+               )
+
+```
+
+
+
+
+\pagebreak
+
+
+
+```{r testing, echo=FALSE, eval=FALSE, cache=FALSE}
+# Load the data
+har_tst	<- "../data/pml-testing.csv"
+tstdf	<- read.csv(har_tst, header=TRUE, sep=",", na.strings=c("NA","#DIV/0!",""), stringsAsFactors = FALSE)
+tstdf	<- select(tstdf, one_of("yaw_belt","total_accel_belt","gyros_belt_x","gyros_belt_y","gyros_belt_z","magnet_belt_x","magnet_belt_y", "magnet_belt_z","roll_arm","pitch_arm","yaw_arm","total_accel_arm","gyros_arm_y","gyros_arm_z", "accel_arm_y","accel_arm_z","magnet_arm_x","magnet_arm_z","roll_dumbbell","pitch_dumbbell","yaw_dumbbell", "total_accel_dumbbell","gyros_dumbbell_y","accel_dumbbell_y","magnet_dumbbell_x","magnet_dumbbell_y","magnet_dumbbell_z","roll_forearm", "pitch_forearm","yaw_forearm","total_accel_forearm","gyros_forearm_x","gyros_forearm_z","accel_forearm_x","accel_forearm_y", "accel_forearm_z","magnet_forearm_x","magnet_forearm_y","magnet_forearm_z"))
+
+answers	<- predict( model.rf, newdata=tstdf)
+
+pml_write_files(answers)
+
+```
